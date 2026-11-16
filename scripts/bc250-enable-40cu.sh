@@ -8,14 +8,15 @@
 #   sudo ./bc250-enable-40cu.sh status    # show current CU state
 #   sudo ./bc250-enable-40cu.sh restore   # restore original amdgpu module
 #
-# Requirements: kernel headers, gcc, make, zstd. Must run as root on BC-250.
-# Tested on: Debian Forky kernel 6.19.14+deb14-amd64
+# Requirements: kernel headers, gcc, make, zstd, curl. Must run as root on BC-250.
+# Tested on: Debian Forky kernel 6.19.14+deb14-amd64, Ubuntu Server 26.04 LTS (kernel 7.0)
 #
 # Authors: duggasco, Claude | License: GPL-2.0
 
 set -euo pipefail
 
 KVER="$(uname -r)"
+KVER_BASE="${KVER%%-*}"
 MODDIR="/lib/modules/${KVER}"
 MODPATH="${MODDIR}/kernel/drivers/gpu/drm/amd/amdgpu/amdgpu.ko"
 MODSRC=""
@@ -24,8 +25,8 @@ CONF40="/etc/modprobe.d/bc250-40cu.conf"
 BACKUP_SUFFIX=".bc250-backup-$(date +%Y%m%d)"
 BC250_PCI_ID="13fe"
 
-info()  { printf '\033[0;32m[+]\033[0m %s\n' "$*"; }
-warn()  { printf '\033[0;33m[!]\033[0m %s\n' "$*"; }
+info()  { printf '\033[0;32m[+]\033[0m %s\n' "$*" >&2; }
+warn()  { printf '\033[0;33m[!]\033[0m %s\n' "$*" >&2; }
 err()   { printf '\033[0;31m[E]\033[0m %s\n' "$*" >&2; }
 die()   { err "$@"; exit 1; }
 
@@ -95,20 +96,54 @@ check_deps() {
     command -v gcc  >/dev/null 2>&1 || missing="${missing} gcc"
     command -v make >/dev/null 2>&1 || missing="${missing} make"
     command -v zstd >/dev/null 2>&1 || missing="${missing} zstd"
+    command -v curl >/dev/null 2>&1 || missing="${missing} curl"
     if [ ! -d "${MODDIR}/build" ]; then
         missing="${missing} linux-headers-${KVER}"
     fi
     if [ -n "$missing" ]; then
-        die "Missing dependencies:${missing}"
+        die "Missing dependencies:${missing}. Install with: apt install gcc make zstd curl linux-headers-\$(uname -r)"
     fi
 }
 
 find_source() {
+    # Check for a pre-extracted tarball left from a previous build
+    if [ -f "${BUILDDIR}/src/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c" ]; then
+        MODSRC="${BUILDDIR}/src"
+        return 0
+    fi
+
+    # Look for local source tarball provided by the linux-source package
+    local srcpkg=""
+    local p
+    for p in \
+        "/usr/src/linux-source-${KVER_BASE}.tar.bz2" \
+        "/usr/src/linux-source-${KVER_BASE}/linux-source-${KVER_BASE}.tar.bz2" \
+        "/usr/src/linux-source-${KVER_BASE}.tar.xz" \
+        "/usr/src/linux-source-${KVER%%+*}.tar.xz"; do
+        [ -f "$p" ] && srcpkg="$p" && break
+    done
+    if [ -z "$srcpkg" ]; then
+        srcpkg="$(find /usr/src -maxdepth 4 \( -name 'linux-source-*.tar.bz2' -o -name 'linux-source-*.tar.xz' \) 2>/dev/null | head -1)"
+    fi
+
+    if [ -n "$srcpkg" ]; then
+        info "Extracting kernel source from ${srcpkg} into ${BUILDDIR}/src..."
+        mkdir -p "${BUILDDIR}/src"
+        tar xf "$srcpkg" -C "${BUILDDIR}/src" --strip-components=1 \
+            --wildcards '*/drivers/gpu/drm/amd/' '*/include/drm/' '*/include/uapi/drm/' 2>/dev/null || \
+        tar xf "$srcpkg" -C "${BUILDDIR}/src" --strip-components=1 \
+            '*/drivers/gpu/drm/amd/' 2>/dev/null || true
+        if [ -f "${BUILDDIR}/src/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c" ]; then
+            MODSRC="${BUILDDIR}/src"
+            return 0
+        fi
+    fi
+
+    # Check for already extracted standalone kernel source trees
     local d
     for d in \
-        "/usr/src/linux-source-${KVER%%-*}" \
-        "/usr/src/linux-source-${KVER%%+*}" \
         "/usr/src/linux-${KVER}" \
+        "/usr/src/linux-${KVER_BASE}" \
         "/usr/src/linux"; do
         if [ -f "$d/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c" ]; then
             MODSRC="$d"
@@ -116,36 +151,21 @@ find_source() {
         fi
     done
 
-    local srcpkg=""
-    local p
-    for p in \
-        "/usr/src/linux-source-${KVER%%-*}.tar.xz" \
-        "/usr/src/linux-source-${KVER%%+*}.tar.xz"; do
-        [ -f "$p" ] && srcpkg="$p" && break
-    done
-    if [ -z "$srcpkg" ]; then
-        srcpkg="$(find /usr/src -maxdepth 4 -name 'linux-source-*.tar.xz' 2>/dev/null | head -1)"
-    fi
-
-    if [ -n "$srcpkg" ]; then
-        info "Extracting kernel source from ${srcpkg}..."
-        mkdir -p "${BUILDDIR}/src"
-        tar xf "$srcpkg" -C "${BUILDDIR}/src" --strip-components=1 \
-            '*/drivers/gpu/drm/amd/amdgpu/' 2>/dev/null || true
-        if [ -f "${BUILDDIR}/src/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c" ]; then
-            MODSRC="${BUILDDIR}/src"
-            return 0
-        fi
-    fi
-
     info "Kernel source not found locally. Trying apt..."
     if command -v apt-get >/dev/null 2>&1; then
-        apt-get install -y "linux-source-${KVER%%-*}" 2>/dev/null || true
-        srcpkg="/usr/src/linux-source-${KVER%%-*}.tar.xz"
-        if [ -f "$srcpkg" ]; then
+        apt-get install -y "linux-source-${KVER_BASE}" 2>/dev/null || true
+        for p in \
+            "/usr/src/linux-source-${KVER_BASE}.tar.bz2" \
+            "/usr/src/linux-source-${KVER_BASE}/linux-source-${KVER_BASE}.tar.bz2" \
+            "/usr/src/linux-source-${KVER_BASE}.tar.xz"; do
+            [ -f "$p" ] && srcpkg="$p" && break
+        done
+        if [ -n "$srcpkg" ]; then
             mkdir -p "${BUILDDIR}/src"
             tar xf "$srcpkg" -C "${BUILDDIR}/src" --strip-components=1 \
-                '*/drivers/gpu/drm/amd/amdgpu/' 2>/dev/null || true
+                --wildcards '*/drivers/gpu/drm/amd/' '*/include/drm/' '*/include/uapi/drm/' 2>/dev/null || \
+            tar xf "$srcpkg" -C "${BUILDDIR}/src" --strip-components=1 \
+                '*/drivers/gpu/drm/amd/' 2>/dev/null || true
             if [ -f "${BUILDDIR}/src/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c" ]; then
                 MODSRC="${BUILDDIR}/src"
                 return 0
@@ -153,7 +173,29 @@ find_source() {
         fi
     fi
 
-    die "Cannot find kernel source for ${KVER}. Install: apt install linux-source-${KVER%%-*}"
+    # Fallback: Download minimal amdgpu subtree directly from kernel.org
+    if command -v curl >/dev/null 2>&1; then
+        local major="${KVER_BASE%%.*}"
+        local url="https://cdn.kernel.org/pub/linux/kernel/v${major}.x/linux-${KVER_BASE}.tar.xz"
+        info "Kernel source not found locally or via apt."
+        info "Downloading amdgpu source from kernel.org (~120 MB)..."
+        info "  ${url}"
+        mkdir -p "${BUILDDIR}/src"
+        if curl -fL --progress-bar "$url" | \
+            tar xJ -C "${BUILDDIR}/src" --strip-components=1 \
+                --wildcards \
+                '*/drivers/gpu/drm/amd/' \
+                '*/include/drm/' \
+                '*/include/uapi/drm/' \
+                2>/dev/null; then
+            if [ -f "${BUILDDIR}/src/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c" ]; then
+                MODSRC="${BUILDDIR}/src"
+                return 0
+            fi
+        fi
+    fi
+
+    die "Cannot find kernel source for ${KVER}. Install: apt install linux-source-${KVER_BASE}"
 }
 
 patch_source() {
@@ -184,8 +226,13 @@ patch_source() {
     cc_file="$(mktemp)"
     write_cc_patch "$cc_file"
 
+    # Two-phase awk: avoid matching the forward declaration of gfx_v10_0_get_cu_info.
+    # A forward declaration ends with ");" on a later line, while the actual body
+    # starts with a standalone "{" on its own line right after the signature.
     awk -v insertfile="$cc_file" '
-    /static.*gfx_v10_0_get_cu_info/ { in_cu_info = 1 }
+    /static.*gfx_v10_0_get_cu_info/ { maybe_func = 1 }
+    maybe_func && /;/               { maybe_func = 0 }
+    maybe_func && /^\{/             { in_cu_info = 1; maybe_func = 0 }
     in_cu_info && /mutex_lock/ && !inserted {
         print
         while ((getline line < insertfile) > 0) print line
@@ -196,7 +243,7 @@ patch_source() {
     { print }
     ' "$gfx" > "${gfx}.new"
 
-    if grep -q 'bc250-cc-clear' "${gfx}.new"; then
+    if grep -q 'bc250-40cu-enable' "${gfx}.new"; then
         mv "${gfx}.new" "$gfx"
         rm -f "$cc_file"
         info "Patch applied successfully."
@@ -211,13 +258,35 @@ build_module() {
     local amdgpu_dir="${MODSRC}/drivers/gpu/drm/amd/amdgpu"
     [ -d "$amdgpu_dir" ] || die "amdgpu source directory not found"
 
+    # define_trace.h (in the kernel headers) resolves the trace header as:
+    #   ../../drivers/gpu/drm/amd/amdgpu/amdgpu_trace.h
+    # relative to its own location, ending up at:
+    #   ${kbuild}/drivers/gpu/drm/amd/amdgpu/amdgpu_trace.h
+    # That directory already exists in linux-headers (contains only Kconfig),
+    # so we copy the trace header there temporarily for the build.
+    local kbuild="${MODDIR}/build"
+    local kbuild_amdgpu="${kbuild}/drivers/gpu/drm/amd/amdgpu"
+    local trace_dst="${kbuild_amdgpu}/amdgpu_trace.h"
+    local trace_copied=0
+    if [ ! -f "$trace_dst" ]; then
+        mkdir -p "$kbuild_amdgpu"
+        cp "${amdgpu_dir}/amdgpu_trace.h" "$trace_dst"
+        trace_copied=1
+    fi
+
     info "Building amdgpu module for kernel ${KVER} (2-5 min)..."
-    make -C "${MODDIR}/build" M="$amdgpu_dir" -j"$(nproc)" modules 2>&1 | tail -5
+    make -C "$kbuild" M="$amdgpu_dir" -j"$(nproc)" modules 2>&1 | tail -10 >&2
+    local make_rc=${PIPESTATUS[0]}
+
+    [ "$trace_copied" -eq 1 ] && rm -f "$trace_dst"
+
+    [ "$make_rc" -eq 0 ] || die "Build failed (make exited $make_rc)"
 
     local built="${amdgpu_dir}/amdgpu.ko"
     [ -f "$built" ] || die "Build failed - amdgpu.ko not produced"
 
-    if ! strings "$built" | grep -q 'bc250_cc_write_mode'; then
+    # Use grep -qa to avoid SIGPIPE/pipefail issue with `strings | grep -q` on large .ko files
+    if ! grep -qa 'bc250_cc_write_mode' "$built"; then
         die "Built module missing bc250_cc_write_mode - patch failed"
     fi
 
@@ -227,13 +296,8 @@ build_module() {
 
 install_module() {
     local built="$1"
-    local target="${MODPATH}"
-
-    if [ -f "${target}.zst" ]; then
-        target="${target}.zst"
-    elif [ ! -f "$target" ]; then
-        target="${target}.zst"
-    fi
+    local target="$(ls "${MODPATH}"* 2>/dev/null | grep -E '\.ko(\.zst|\.xz)?$' | head -n 1)"
+    [ -n "$target" ] || target="${MODPATH}.zst"
 
     if [ -f "$target" ] && [ ! -f "${target}${BACKUP_SUFFIX}" ]; then
         info "Backing up original to ${target}${BACKUP_SUFFIX}"
@@ -241,13 +305,21 @@ install_module() {
     fi
 
     if [ "${target%.zst}" != "$target" ]; then
-        info "Compressing and installing module..."
+        info "Compressing and installing module (zstd)..."
         zstd -f "$built" -o "$target"
+    elif [ "${target%.xz}" != "$target" ]; then
+        info "Compressing and installing module (xz)..."
+        xz -c "$built" > "$target"
     else
+        info "Installing module..."
         cp "$built" "$target"
     fi
 
     depmod -a "$KVER"
+    if command -v update-initramfs >/dev/null 2>&1; then
+        info "Updating initramfs..."
+        update-initramfs -u -k "$KVER"
+    fi
     info "Module installed at ${target}"
 }
 
@@ -267,10 +339,14 @@ do_build() {
 do_enable() {
     printf '# BC-250 40 CU re-enablement\noptions amdgpu bc250_cc_write_mode=3\n' > "$CONF40"
     info "40 CU mode configured in ${CONF40}"
-    if ! modinfo amdgpu 2>/dev/null | grep -q 'bc250_cc_write_mode'; then
+    if ! ( set +o pipefail; modinfo amdgpu 2>/dev/null | grep -q 'bc250_cc_write_mode' ); then
         warn "Patched module not detected. Run: sudo $0 build"
         rm -f "$CONF40"
         exit 1
+    fi
+    if command -v update-initramfs >/dev/null 2>&1; then
+        info "Updating initramfs with 40 CU config..."
+        update-initramfs -u -k "$KVER"
     fi
     info "Rebooting..."
     sleep 2
@@ -279,20 +355,35 @@ do_enable() {
 
 do_disable() {
     rm -f "$CONF40"
-    info "40 CU config removed. Rebooting to stock 24 CU..."
+    info "40 CU config removed."
+    if command -v update-initramfs >/dev/null 2>&1; then
+        info "Updating initramfs..."
+        update-initramfs -u -k "$KVER"
+    fi
+    info "Rebooting to stock 24 CU..."
     sleep 2
     reboot
 }
 
 do_restore() {
     local target="${MODPATH}"
-    if [ -f "${target}.zst" ]; then target="${target}.zst"; fi
     local backup
-    backup="$(ls -1 "${target}.bc250-backup-"* 2>/dev/null | head -1)"
+    backup="$(ls -1 "${target}"*".bc250-backup-"* 2>/dev/null | head -1)"
     [ -n "$backup" ] || die "No backup found"
-    cp "$backup" "$target"
+
+    # Wipe the patched module(s)
+    rm -f "${target}.zst" "${target}.xz" "${target}"
+
+    # Restore the original
+    local orig_name="${backup%.bc250-backup-*}"
+    cp "$backup" "$orig_name"
+
     rm -f "$CONF40"
     depmod -a "$KVER"
+    if command -v update-initramfs >/dev/null 2>&1; then
+        info "Updating initramfs..."
+        update-initramfs -u -k "$KVER"
+    fi
     info "Original module restored. Reboot to apply."
 }
 
@@ -305,7 +396,7 @@ do_status() {
         printf '  PCI device:     \033[0;31mBC-250 not found\033[0m\n'
     fi
 
-    if modinfo amdgpu 2>/dev/null | grep -q 'bc250_cc_write_mode'; then
+    if ( set +o pipefail; modinfo amdgpu 2>/dev/null | grep -q 'bc250_cc_write_mode' ); then
         printf '  amdgpu module:  \033[0;32mpatched\033[0m\n'
     else
         printf '  amdgpu module:  \033[0;33mstock (unpatched)\033[0m\n'
@@ -316,7 +407,7 @@ do_status() {
     printf '  write_mode:     %s\n' "$mode"
 
     local cu_line
-    cu_line="$(dmesg 2>/dev/null | grep 'active_cu_number' | tail -1)"
+    cu_line="$( ( set +o pipefail; dmesg 2>/dev/null | grep 'active_cu_number' | tail -1 ) || true )"
     if [ -n "$cu_line" ]; then
         local cus
         cus="$(echo "$cu_line" | grep -o 'active_cu_number [0-9]*' | awk '{print $2}')"
